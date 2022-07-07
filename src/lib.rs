@@ -3,7 +3,6 @@
 use core::fmt::Write;
 use core::marker::PhantomPinned;
 use core::mem::{transmute, MaybeUninit};
-use core::ops::DerefMut;
 use core::panic::PanicInfo;
 use core::pin::Pin;
 use core::ptr::null_mut;
@@ -12,18 +11,26 @@ static mut PANIC_HANDLER_GETTER: Option<unsafe fn(handler: *mut (), info: &Panic
 static mut PANIC_HANDLER: *mut () = null_mut();
 
 /// Use monomorphization to "save" the type parameter of the static pointer
-unsafe fn trampoline<W: Write>(ptr: *mut (), info: &PanicInfo) {
-    let handler: &mut PanicHandler<W> = transmute(ptr);
+unsafe fn trampoline<W: Write, F: FnMut(&mut W, &PanicInfo)>(ptr: *mut (), info: &PanicInfo) {
+    let handler: &mut PanicHandler<W, F> = transmute(ptr);
 
-    let _ = write!(handler.deref_mut(), "{}", info);
+    // safe because self.writer is only uninit during drop
+    let writer: &mut W = { &mut *handler.writer.as_mut_ptr() };
+
+    (handler.hook)(writer, info)
 }
 
-pub struct PanicHandler<W: Write> {
+pub struct PanicHandler<W: Write, F: FnMut(&mut W, &PanicInfo)> {
     writer: MaybeUninit<W>,
+    hook: F,
     _pin: PhantomPinned,
 }
 
-impl<W: Write> PanicHandler<W> {
+fn default_hook<W: Write>(out: &mut W, info: &PanicInfo) {
+    let _ = write!(out, "{}", info);
+}
+
+impl<W: Write, F: FnMut(&mut W, &PanicInfo)> PanicHandler<W, F> {
     /// Create a panic handler from a `core::fmt::Write`
     ///
     /// Note that the returned handler is detached when it goes out of scope so in most cases it's
@@ -32,18 +39,24 @@ impl<W: Write> PanicHandler<W> {
     /// Additionally, the panic handler implements `Deref` for the provided `Write` and can be used
     /// in place of the original `Write` throughout the app.
     #[must_use = "the panic handler must be kept in scope"]
-    pub fn new(writer: W) -> Pin<Self> {
+    pub fn new_with_hook(writer: W, hook: F) -> Pin<Self> {
         let handler = unsafe {
             Pin::new_unchecked(PanicHandler {
                 writer: MaybeUninit::new(writer),
+                hook,
                 _pin: PhantomPinned,
             })
         };
         unsafe {
-            PANIC_HANDLER_GETTER = Some(trampoline::<W>);
+            PANIC_HANDLER_GETTER = Some(trampoline::<W, F>);
             PANIC_HANDLER = transmute(&handler);
         }
         handler
+    }
+
+    pub fn new(writer: W) -> Pin<PanicHandler<W, fn(&mut W, &PanicInfo)>> {
+        // Default Hook:
+        PanicHandler::<W, _>::new_with_hook(writer, default_hook::<W>)
     }
 
     /// Detach this panic handler and return the underlying writer
@@ -62,7 +75,7 @@ impl<W: Write> PanicHandler<W> {
     }
 }
 
-impl<W: Write> Drop for PanicHandler<W> {
+impl<W: Write, F: FnMut(&mut W, &PanicInfo)> Drop for PanicHandler<W, F> {
     fn drop(&mut self) {
         unsafe {
             PANIC_HANDLER_GETTER = None;
@@ -71,7 +84,7 @@ impl<W: Write> Drop for PanicHandler<W> {
     }
 }
 
-impl<W: Write> core::ops::Deref for PanicHandler<W> {
+impl<W: Write, F: FnMut(&mut W, &PanicInfo)> core::ops::Deref for PanicHandler<W, F> {
     type Target = W;
 
     fn deref(&self) -> &Self::Target {
@@ -80,7 +93,7 @@ impl<W: Write> core::ops::Deref for PanicHandler<W> {
     }
 }
 
-impl<W: Write> core::ops::DerefMut for PanicHandler<W> {
+impl<W: Write, F: FnMut(&mut W, &PanicInfo)> core::ops::DerefMut for PanicHandler<W, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // safe because self.writer is only uninit during drop
         unsafe { &mut *self.writer.as_mut_ptr() }
