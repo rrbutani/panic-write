@@ -39,43 +39,48 @@ impl<W: Write, F: FnMut(&mut W, &PanicInfo)> PanicHandler<W, F> {
     /// Additionally, the panic handler implements `Deref` for the provided `Write` and can be used
     /// in place of the original `Write` throughout the app.
     #[must_use = "the panic handler must be kept in scope"]
-    pub fn new_with_hook(writer: W, hook: F) -> Pin<Self> {
-        let handler = unsafe {
-            Pin::new_unchecked(PanicHandler {
-                writer: MaybeUninit::new(writer),
-                hook,
-                _pin: PhantomPinned,
-            })
-        };
-        unsafe {
-            PANIC_HANDLER_GETTER = Some(trampoline::<W, F>);
-            PANIC_HANDLER = transmute(&handler);
+    pub fn new_with_hook(writer: W, hook: F) -> Self {
+        PanicHandler {
+            writer: MaybeUninit::new(writer),
+            hook,
+            _pin: PhantomPinned,
         }
-        handler
     }
 
-    pub fn new(writer: W) -> Pin<PanicHandler<W, fn(&mut W, &PanicInfo)>> {
+    pub fn new(writer: W) -> PanicHandler<W, fn(&mut W, &PanicInfo)> {
         // Default Hook:
         PanicHandler::<W, _>::new_with_hook(writer, default_hook::<W>)
     }
 
+    pub fn register(self: &mut Pin<&mut Self>) {
+        unsafe {
+            PANIC_HANDLER_GETTER = Some(trampoline::<W, F>);
+            PANIC_HANDLER = transmute(self.as_ref());
+        }
+    }
+
     /// Detach this panic handler and return the underlying writer
-    pub fn detach(handler: Pin<Self>) -> W {
+    pub fn detach(handler: Pin<&mut Self>) -> W {
         unsafe {
             PANIC_HANDLER_GETTER = None;
             PANIC_HANDLER = null_mut();
 
             // unpin is safe because the pointer to the handler is removed
-            let mut handler = Pin::into_inner_unchecked(handler);
+            let handler = Pin::into_inner_unchecked(handler);
             let writer = core::mem::replace(&mut handler.writer, MaybeUninit::uninit());
 
             // safe because self.writer is only uninit during drop
             writer.assume_init()
         }
     }
+
+    pub fn get_inner(self: Pin<&mut Self>) -> &mut W {
+        unsafe { self.get_unchecked_mut() }
+    }
 }
 
-impl<W: Write, F: FnMut(&mut W, &PanicInfo)> Drop for PanicHandler<W, F> {
+// TODO: what happens we if have multiple of these?
+impl<W: Write, F: FnMut(&mut W, &PanicInfo)> Drop for Pin<&mut PanicHandler<W, F>> {
     fn drop(&mut self) {
         unsafe {
             PANIC_HANDLER_GETTER = None;
